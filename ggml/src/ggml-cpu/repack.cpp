@@ -4897,7 +4897,55 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 return;
             }
 
-            for (int ir1 = 0; ir1 < nr1; ir1++) {
+            const int64_t ncols = src0_cur_end - src0_cur_start;
+            int64_t ir1 = 0;
+            // Use multi-row AVX2/NEON GEMM kernels for batched prefill instead of streaming weights per token via GEMV.
+            if (nr1 >= 4 && (ncols % NB_COLS) == 0 && (INTER_SIZE == 4 || INTER_SIZE == 8)) {
+                struct mul_mat_id_scratch {
+                    std::vector<float>   f32;
+                    std::vector<uint8_t> vy;
+                    std::vector<float>   out;
+                };
+                static thread_local mul_mat_id_scratch scratch;
+                const int64_t batch_cap = 16;
+                const int64_t nr1_gemm  = nr1 - (nr1 % 4);
+                const int64_t init_nr   = std::min<int64_t>(batch_cap, nr1_gemm);
+                if (scratch.f32.size() < (size_t) (4 * ne10)) {
+                    scratch.f32.resize((size_t) (4 * ne10));
+                }
+                if (scratch.vy.size() < (size_t) (init_nr * nbw1)) {
+                    scratch.vy.resize((size_t) (init_nr * nbw1));
+                }
+                if (scratch.out.size() < (size_t) (init_nr * ncols)) {
+                    scratch.out.resize((size_t) (init_nr * ncols));
+                }
+                for (; ir1 < nr1_gemm; ) {
+                    const int64_t batch_nr = (nr1_gemm - ir1) >= batch_cap ? batch_cap : 4;
+                    for (int64_t q = 0; q < batch_nr; q += 4) {
+                        for (int k = 0; k < 4; ++k) {
+                            const auto & rm = MMID_MATRIX_ROW(cur_a, ir1 + q + k);
+                            const int64_t i11 = rm.i1 % ne11;
+                            const int64_t i12 = rm.i2;
+                            const float * row_ptr = (const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12);
+                            memcpy(scratch.f32.data() + (size_t) k * ne10, row_ptr, (size_t) ne10 * sizeof(float));
+                        }
+                        ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(
+                            scratch.f32.data(), scratch.vy.data() + (size_t) q * nbw1, 4, ne10);
+                    }
+                    gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        ne00, scratch.out.data(), (size_t) ncols,
+                        src0_cur + src0_cur_start * nb01, scratch.vy.data(),
+                        (int) batch_nr, (int) ncols);
+                    for (int64_t r = 0; r < batch_nr; ++r) {
+                        const auto & rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                        float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                        memcpy(dst_row, scratch.out.data() + (size_t) r * ncols, (size_t) ncols * sizeof(float));
+                    }
+                    ir1 += batch_nr;
+                }
+            }
+
+            for (; ir1 < nr1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
                 const int id = row_mapping.i1;  // selected expert index
@@ -4912,7 +4960,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
-                    src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
+                    src0_cur + src0_cur_start * nb01, src1_col, 1, ncols);
             }
         }
 #undef MMID_MATRIX_ROW

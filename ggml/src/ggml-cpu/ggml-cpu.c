@@ -435,6 +435,7 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
 typedef pthread_t          ggml_thread_t;
 
 #if defined(_WIN32)
+#pragma comment(lib, "Synchronization.lib")
 
 typedef CONDITION_VARIABLE ggml_cond_t;
 typedef SRWLOCK            ggml_mutex_t;
@@ -496,6 +497,7 @@ struct ggml_threadpool {
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
+    atomic_int GGML_CACHE_ALIGN wake_seq;
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
@@ -2766,6 +2768,10 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     ggml_cond_broadcast(&threadpool->cond);
     ggml_mutex_unlock(&threadpool->mutex);
+#if defined(_WIN32)
+    atomic_fetch_add_explicit(&threadpool->wake_seq, 1, memory_order_seq_cst);
+    WakeByAddressAll((void *) &threadpool->wake_seq);
+#endif
 
     for (int j = 1; j < n_threads; j++) {
         int32_t rc = ggml_thread_join(workers[j].thrd, NULL);
@@ -2788,12 +2794,20 @@ static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
     GGML_PRINT_DEBUG("Pausing threadpool\n");
     threadpool->pause = true;
     ggml_cond_broadcast(&threadpool->cond);
+#if defined(_WIN32)
+    atomic_fetch_add_explicit(&threadpool->wake_seq, 1, memory_order_seq_cst);
+    WakeByAddressAll((void *) &threadpool->wake_seq);
+#endif
 }
 
 static void ggml_threadpool_resume_locked(struct ggml_threadpool * threadpool) {
     GGML_PRINT_DEBUG("Resuming threadpool\n");
     threadpool->pause = false;
     ggml_cond_broadcast(&threadpool->cond);
+#if defined(_WIN32)
+    atomic_fetch_add_explicit(&threadpool->wake_seq, 1, memory_order_seq_cst);
+    WakeByAddressAll((void *) &threadpool->wake_seq);
+#endif
 }
 #endif
 
@@ -3220,6 +3234,26 @@ static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * st
 static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
+#if defined(_WIN32)
+    if (threadpool->poll == 0) {
+        return ggml_graph_compute_thread_ready(state) && state->pending;
+    }
+    LARGE_INTEGER freq, now, deadline;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    // Calibrated 25 us per poll unit (e.g. poll=4 -> 100 us) for GPU<->CPU split overlap without burning idle CPU.
+    deadline.QuadPart = now.QuadPart + (freq.QuadPart * (LONGLONG) threadpool->poll * 25LL) / 1000000LL;
+    do {
+        for (int i = 0; i < 32; ++i) {
+            if (ggml_graph_compute_thread_ready(state)) {
+                return state->pending;
+            }
+            ggml_thread_cpu_relax();
+        }
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart < deadline.QuadPart);
+    return state->pending;
+#else
     // This seems to make 0 ... 100 a decent range for polling level across modern processors.
     // Perhaps, we can adjust it dynamically based on load and things.
     const uint64_t n_rounds = 1024UL * 128 * threadpool->poll;
@@ -3230,6 +3264,7 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
     }
 
     return state->pending;
+#endif
 }
 
 static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state * state) {
@@ -3240,6 +3275,15 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
         return state->pending;
     }
 
+#if defined(_WIN32)
+    while (!ggml_graph_compute_thread_ready(state)) {
+        int seq = atomic_load_explicit(&threadpool->wake_seq, memory_order_seq_cst);
+        if (ggml_graph_compute_thread_ready(state)) {
+            break;
+        }
+        WaitOnAddress((volatile void *) &threadpool->wake_seq, &seq, sizeof(seq), INFINITE);
+    }
+#else
     ggml_mutex_lock_shared(&threadpool->mutex);
     while (!ggml_graph_compute_thread_ready(state)) {
         // No new work. Wait for the signal.
@@ -3247,6 +3291,7 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
         ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
     }
     ggml_mutex_unlock_shared(&threadpool->mutex);
+#endif
 
     return state->pending;
 }
@@ -3264,12 +3309,20 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         // Check if we need to sleep
         while (threadpool->pause) {
             GGML_PRINT_DEBUG("thread #%d inside pause loop\n", state->ith);
+#if defined(_WIN32)
+            int seq = atomic_load_explicit(&threadpool->wake_seq, memory_order_seq_cst);
+            if (!threadpool->pause || threadpool->stop) {
+                break;
+            }
+            WaitOnAddress((volatile void *) &threadpool->wake_seq, &seq, sizeof(seq), INFINITE);
+#else
             ggml_mutex_lock_shared(&threadpool->mutex);
             if (threadpool->pause) {
                 ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
             }
             GGML_PRINT_DEBUG("thread #%d resuming after wait\n", state->ith);
             ggml_mutex_unlock_shared(&threadpool->mutex);
+#endif
         }
 
         // This needs to be checked for after the cond_wait
@@ -3291,18 +3344,29 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
 // Start processing new graph
 static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
 {
-    // Always take the mutex here because the worker threads are doing hybrid poll/wait
-
-    ggml_mutex_lock(&threadpool->mutex);
-
     // Update the number of active threads and the graph count
     int n_graph = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >> GGML_THREADPOOL_N_THREADS_BITS;
     n_graph = ((n_graph + 1) << GGML_THREADPOOL_N_THREADS_BITS) | (n_threads & GGML_THREADPOOL_N_THREADS_MASK);
 
     GGML_PRINT_DEBUG("compute-kickoff: n_threads %d n_graph %d\n", n_threads, n_graph);
 
-    // Indicate the graph is ready to be processed
-    // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
+#if defined(_WIN32)
+    atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
+    if (threadpool->pause) {
+        ggml_mutex_lock(&threadpool->mutex);
+        ggml_thread_apply_priority(threadpool->prio);
+        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
+            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
+        }
+        ggml_threadpool_resume_locked(threadpool);
+        ggml_mutex_unlock(&threadpool->mutex);
+    } else {
+        atomic_fetch_add_explicit(&threadpool->wake_seq, 1, memory_order_seq_cst);
+        WakeByAddressAll((void *) &threadpool->wake_seq);
+    }
+#else
+    // Always take the mutex here because the worker threads are doing hybrid poll/wait
+    ggml_mutex_lock(&threadpool->mutex);
     atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
 
     if (threadpool->pause) {
@@ -3319,6 +3383,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     }
 
     ggml_mutex_unlock(&threadpool->mutex);
+#endif
 }
 
 #endif // GGML_USE_OPENMP
@@ -3334,6 +3399,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->n_graph          = 0;
+        threadpool->wake_seq         = 0;
         threadpool->n_barrier        = 0;
         threadpool->n_barrier_passed = 0;
         threadpool->current_chunk    = 0;

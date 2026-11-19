@@ -6888,6 +6888,19 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+static bool ggml_backend_cuda_device_event_query(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    const cudaError_t err = cudaEventQuery((cudaEvent_t)event->context);
+    if (err == cudaSuccess) {
+        return true;
+    }
+    if (err == cudaErrorNotReady) {
+        return false;
+    }
+    CUDA_CHECK(err);
+    return false;
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -6904,6 +6917,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .event_new               = */ ggml_backend_cuda_device_event_new,
     /* .event_free              = */ ggml_backend_cuda_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
+    /* .event_query             = */ ggml_backend_cuda_device_event_query,
 };
 
 // backend reg
