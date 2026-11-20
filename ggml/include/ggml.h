@@ -260,7 +260,8 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_TQ3     = 44, // TurboQuant 3.5 bpw: 2-bit Lloyd-Max + 1-bit QJL residual
+        GGML_TYPE_COUNT   = 45,
     };
 
     // [TAG_GGML_PREC]
@@ -430,6 +431,9 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_SLEEP,
+
+        GGML_OP_QUEST_UPDATE,
+        GGML_OP_QUEST_ROWS,
 
         GGML_OP_COUNT,
     };
@@ -2284,6 +2288,31 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // DuoAttention: bitmask of streaming KV heads (skipping middle KV positions between sink and recent window).
+    GGML_API void ggml_flash_attn_ext_set_duo(
+            struct ggml_tensor * a,
+            uint32_t             stream_mask,
+            int32_t              sink_cols,
+            int32_t              recent_col_start);
+
+    // Update page min/max key envelope [D, n_pages, 2 * n_head_kv] F16 in-place (returns view of k_minmax).
+    GGML_API struct ggml_tensor * ggml_quest_update(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_minmax,
+            struct ggml_tensor  * k_cur,
+            struct ggml_tensor  * k_idxs,
+            int32_t               page_size);
+
+    // Expand sorted top page indices [n_active_pages] I32 -> selected KV row indices [n_keep_rows] I32 (-1 padded).
+    GGML_API struct ggml_tensor * ggml_quest_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_pages,
+            int32_t               n_active_tokens,
+            int32_t               page_size,
+            int32_t               n_sink_pages,
+            int32_t               n_recent_pages,
+            int32_t               n_keep_rows);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

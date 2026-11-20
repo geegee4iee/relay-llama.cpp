@@ -117,7 +117,8 @@ public:
                  const char *   name_tag = "",
         // lightning indexer keys are rotated with the indexer RoPE parameters
                        bool   is_indexer = false,
-                   uint32_t   n_cpu_kv = 0);
+                   uint32_t   n_cpu_kv = 0,
+                   uint32_t   kv_sparse_threshold = 0);
 
     ~llama_kv_cache() = default;
 
@@ -215,6 +216,12 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
+    static constexpr uint32_t QUEST_PAGE_SIZE = 16;
+
+    ggml_tensor * update_quest_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * get_k_minmax(int32_t il) const;
+    uint32_t      get_quest_active_tokens() const;
+
     //
     // preparation API
     //
@@ -283,7 +290,13 @@ private:
 
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
+
+        ggml_tensor * k_minmax = nullptr;
     };
+
+    void reset_quest_minmax(int32_t page_start = 0, int32_t page_end = -1);
+
+    uint32_t kv_sparse_threshold = 0;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -439,6 +452,10 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+
+    ggml_tensor * update_quest_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * get_k_minmax(int32_t il) const;
+    uint32_t      get_quest_active_tokens() const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

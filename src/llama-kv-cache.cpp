@@ -81,13 +81,15 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share,
                const char * name_tag,
                      bool   is_indexer,
-                 uint32_t   n_cpu_kv) :
+                 uint32_t   n_cpu_kv,
+                 uint32_t   kv_sparse_threshold) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    v_cells(*v_cells_impl),
+    kv_sparse_threshold(kv_sparse_threshold) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -115,7 +117,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream) + 1u)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -248,6 +250,20 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, model.layers[il].k_cache_s, model.layers[il].v_cache_s, k_stream, v_stream, });
+
+        if (kv_sparse_threshold > 0 && kv_size >= kv_sparse_threshold && n_stream == 1 &&
+                !is_mla && !hparams.is_swa(il) && !other && (il == 0 || il == 1 || (il % 2 == 0))) {
+            ggml_backend_buffer_type_t buft_q = offload
+                ? ggml_backend_dev_buffer_type(model.dev_layer(il))
+                : ggml_backend_cpu_buffer_type();
+            if (ggml_context * ctx_q = ctx_for_buft(buft_q)) {
+                const uint32_t n_pages = (kv_size + QUEST_PAGE_SIZE - 1) / QUEST_PAGE_SIZE;
+                ggml_tensor * km = ggml_new_tensor_3d(ctx_q, GGML_TYPE_F16,
+                        hparams.n_embd_head_k(il), n_pages, 2 * hparams.n_head_kv(il));
+                ggml_format_name(km, "cache_%sk_minmax_l%d", name_tag, il);
+                layers.back().k_minmax = km;
+            }
+        }
     }
 
     if (reuse) {
@@ -280,6 +296,8 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
     }
+
+    reset_quest_minmax(0, -1);
 
     {
         const size_t memory_size_k = size_k_bytes();
@@ -436,6 +454,7 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+    reset_quest_minmax(0, -1);
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -465,6 +484,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+        if (seq_to_stream[seq_id] == 0 && new_head < cells.size()) {
+            reset_quest_minmax((int32_t) (new_head / QUEST_PAGE_SIZE), -1);
+        }
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -488,6 +510,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
+            }
+            if (s == 0 && new_head < cells.size()) {
+                reset_quest_minmax((int32_t) (new_head / QUEST_PAGE_SIZE), -1);
             }
         }
     }
@@ -3134,4 +3159,105 @@ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const lla
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+void llama_kv_cache::reset_quest_minmax(int32_t page_start, int32_t page_end) {
+    if (ctxs_bufs.no_alloc || kv_sparse_threshold == 0) {
+        return;
+    }
+
+    size_t max_count = 0;
+    for (const auto & layer : layers) {
+        if (!layer.k_minmax) {
+            continue;
+        }
+        const int32_t n_pages = (int32_t) layer.k_minmax->ne[1];
+        const int32_t p0 = std::max<int32_t>(0, page_start);
+        const int32_t p1 = (page_end < 0 || page_end > n_pages) ? n_pages : page_end;
+        if (p0 < p1) {
+            max_count = std::max(max_count, size_t(p1 - p0) * (size_t) layer.k_minmax->ne[0]);
+        }
+    }
+    if (max_count == 0) {
+        return;
+    }
+
+    std::vector<uint16_t> fill_pos(max_count, 0x7BFF); // +65504.0f (FP16)
+    std::vector<uint16_t> fill_neg(max_count, 0xFBFF); // -65504.0f (FP16)
+
+    for (const auto & layer : layers) {
+        ggml_tensor * km = layer.k_minmax;
+        if (!km || !km->buffer) {
+            continue;
+        }
+        const int64_t D         = km->ne[0];
+        const int64_t n_pages   = km->ne[1];
+        const int64_t n_head_kv = km->ne[2] / 2;
+        const int32_t p0        = std::max<int32_t>(0, page_start);
+        const int32_t p1        = (page_end < 0 || page_end > (int32_t) n_pages) ? (int32_t) n_pages : page_end;
+        if (p0 >= p1) {
+            continue;
+        }
+        const size_t n_elems = size_t(p1 - p0) * (size_t) D;
+        const size_t n_bytes = n_elems * sizeof(uint16_t);
+        for (int64_t h = 0; h < n_head_kv; ++h) {
+            const size_t off_min = size_t(h             * n_pages + p0) * (size_t) D * sizeof(uint16_t);
+            const size_t off_max = size_t((h + n_head_kv) * n_pages + p0) * (size_t) D * sizeof(uint16_t);
+            ggml_backend_tensor_set(km, fill_pos.data(), off_min, n_bytes);
+            ggml_backend_tensor_set(km, fill_neg.data(), off_max, n_bytes);
+        }
+    }
+}
+
+ggml_tensor * llama_kv_cache::update_quest_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    if (kv_sparse_threshold == 0 || n_stream != 1 || other != nullptr) {
+        return nullptr;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    ggml_tensor * km = layers[it->second].k_minmax;
+    if (!km) {
+        return nullptr;
+    }
+    if (!ggml_is_contiguous(k_cur)) {
+        k_cur = ggml_cont(ctx, k_cur);
+    }
+    return ggml_quest_update(ctx, km, k_cur, k_idxs, (int32_t) QUEST_PAGE_SIZE);
+}
+
+ggml_tensor * llama_kv_cache::get_k_minmax(int32_t il) const {
+    if (kv_sparse_threshold == 0 || n_stream != 1 || other != nullptr) {
+        return nullptr;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    return layers[it->second].k_minmax;
+}
+
+uint32_t llama_kv_cache::get_quest_active_tokens() const {
+    if (kv_sparse_threshold == 0 || n_stream != 1 || other != nullptr) {
+        return 0;
+    }
+    const auto & cells = v_cells[0];
+    const uint32_t used = cells.get_used();
+    if (used == 0 || used != cells.used_max_p1() || cells.seq_n_cells(0) != used) {
+        return 0;
+    }
+    return used;
+}
+
+ggml_tensor * llama_kv_cache_context::update_quest_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->update_quest_k(ctx, k_cur, k_idxs, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_minmax(int32_t il) const {
+    return kv->get_k_minmax(il);
+}
+
+uint32_t llama_kv_cache_context::get_quest_active_tokens() const {
+    return kv->get_quest_active_tokens();
 }

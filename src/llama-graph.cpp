@@ -702,6 +702,16 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
+    res &= !quest_or_duo_built;
+    if (params.ubatch.n_tokens == 1 && mctx != nullptr) {
+        if (params.cparams.kv_sparse_threshold > 0 && mctx->get_quest_active_tokens() >= params.cparams.kv_sparse_threshold) {
+            res = false;
+        }
+        if (params.cparams.kv_duo_ratio > 0.0f && mctx->get_n_kv() >= 4096) {
+            res = false;
+        }
+    }
+
     res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
 
     return res;
@@ -1893,7 +1903,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+        ggml_mul_mat_id(ctx0, (cached && moe_cache != nullptr) ? moe_cache->get_experts(w) : w, cur_mm, slots);
 
     prec_policy.apply(res);
 
@@ -2545,6 +2555,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // PreMoE / DASE dynamic tail-expert skipping for small decode/verify batches
+    ggml_tensor * moe_prune_mask = nullptr;
+    const ggml_tensor * moe_cache_weights = nullptr;
+    const bool use_moe_prune =
+        cparams.moe_prob_thresh > 0.0f &&
+        ubatch.n_tokens <= 8 &&
+        n_expert_used > std::max<int32_t>(1, (int32_t) cparams.moe_min_k) &&
+        ggml_is_quantized(down_exps->type) &&
+        (!up_exps || ggml_is_quantized(up_exps->type)) &&
+        (!gate_exps || ggml_is_quantized(gate_exps->type)) &&
+        (!gate_up_exps || ggml_is_quantized(gate_up_exps->type));
+    if (use_moe_prune) {
+        const int32_t min_k = std::clamp<int32_t>((int32_t) cparams.moe_min_k, 1, n_expert_used - 1);
+        ggml_tensor * top_w     = ggml_view_3d(ctx0, weights, 1, 1, n_tokens, weights->nb[1], weights->nb[2], 0);
+        ggml_tensor * head_w    = ggml_view_3d(ctx0, weights, 1, min_k, n_tokens, weights->nb[1], weights->nb[2], 0);
+        ggml_tensor * tail_w    = ggml_view_3d(ctx0, weights, 1, n_expert_used - min_k, n_tokens, weights->nb[1], weights->nb[2], min_k * weights->nb[1]);
+        ggml_tensor * head_mask = ggml_clamp(ctx0, head_w, 1.0f, 1.0f);
+        ggml_tensor * thresh    = ggml_scale_bias(ctx0, top_w, cparams.moe_prob_thresh, -1e-6f);
+        ggml_tensor * tail_mask = ggml_step(ctx0, ggml_sub(ctx0, tail_w, thresh));
+        ggml_tensor * mask_3d   = ggml_concat(ctx0, head_mask, tail_mask, 1);
+
+        ggml_tensor * orig_2d   = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * orig_sum  = ggml_sum_rows(ctx0, orig_2d);
+        ggml_tensor * kept_3d   = ggml_mul(ctx0, weights, mask_3d);
+        ggml_tensor * kept_2d   = ggml_reshape_2d(ctx0, kept_3d, n_expert_used, n_tokens);
+        ggml_tensor * kept_sum  = ggml_clamp(ctx0, ggml_sum_rows(ctx0, kept_2d), 1e-6f, INFINITY);
+        ggml_tensor * rescale   = ggml_div(ctx0, orig_sum, kept_sum);
+        weights                 = ggml_reshape_3d(ctx0, ggml_mul(ctx0, kept_2d, rescale), 1, n_expert_used, n_tokens);
+        ggml_build_forward_expand(gf, weights);
+        cb(weights, "ffn_moe_weights_pruned", il);
+
+        moe_prune_mask    = ggml_reshape_2d(ctx0, mask_3d, n_expert_used, n_tokens);
+        moe_cache_weights = weights;
+    }
+
     // benchmark only: the expert GEMMs use random ids, the router above is not changed
     if (cparams.moe_random_routing && n_expert == hparams.n_expert && n_expert_used <= hparams.n_expert_used_max() && n_tokens <= ubatch.n_tokens) {
         // fused top-k kernels write the router ids together with the weights, so keep the ids alive until here
@@ -2563,8 +2608,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, cur);
 
     // the experts of host-resident layers may be read from the MoE cache (see llama_moe_cache::build_lookup)
-    const llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
-        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts);
+    llama_moe_cache_lookup cache = moe_cache == nullptr ? llama_moe_cache_lookup{} :
+        moe_cache->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn, moe_cache_weights, cparams.moe_min_k }, selected_experts);
+
+    auto apply_moe_id_mask = [&](ggml_tensor * ids_tensor) -> ggml_tensor * {
+        if (moe_prune_mask == nullptr || ids_tensor == nullptr) {
+            return ids_tensor;
+        }
+        ggml_tensor * f = ggml_scale_bias(ctx0, ggml_cast(ctx0, ids_tensor, GGML_TYPE_F32), 1.0f, 1.0f);
+        f = ggml_mul(ctx0, f, moe_prune_mask);
+        f = ggml_scale_bias(ctx0, f, 1.0f, -1.0f);
+        return ggml_cast(ctx0, f, GGML_TYPE_I32);
+    };
+    if (cache.slots != nullptr) {
+        cache.slots = apply_moe_id_mask(cache.slots);
+        if (n_tokens > 1) {
+            cache.cpu_ids = apply_moe_id_mask(cache.cpu_ids);
+        }
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2737,8 +2798,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
+    ggml_tensor * uncached_mm_ids = moe_prune_mask != nullptr ? apply_moe_id_mask(selected_experts) : nullptr;
     ggml_tensor * experts = cache.slots == nullptr ?
-        build_experts(cur, selected_experts, nullptr, true) :
+        build_experts(cur, selected_experts, uncached_mm_ids, false) :
         moe_cache->build_experts(*this, cache, cur, selected_experts,
                 [](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data) {
                     return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);
@@ -3230,6 +3292,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+        if (cparams.kv_duo_ratio > 0.0f && q->ne[1] == 1 && k->ne[2] <= 32) {
+            const int32_t nh_kv = (int32_t) k->ne[2];
+            const int32_t n_stream_heads = std::min<int32_t>(nh_kv - 1, std::max<int32_t>(0, (int32_t) floorf(nh_kv * cparams.kv_duo_ratio)));
+            const int32_t n_cols = kv_rows ? (int32_t) kv_rows->ne[0] : (int32_t) k->ne[1];
+            const int32_t sink_cols = kv_rows ? 64 : 256;
+            const int32_t recent_min = kv_rows ? 1024 : 4096;
+            const int32_t recent_win = kv_rows ? 512 : 1024;
+            if (n_stream_heads > 0 && n_cols >= recent_min) {
+                uint32_t duo_mask = 0;
+                for (int32_t h = nh_kv - n_stream_heads; h < nh_kv; ++h) {
+                    duo_mask |= (1u << h);
+                }
+                ggml_flash_attn_ext_set_duo(cur, duo_mask, sink_cols, std::max<int32_t>(sink_cols, n_cols - recent_win));
+            }
+        }
         ggml_prec_set_acc(cur, GGML_PREC_F32);
         attn_op = cur;
 
@@ -3531,6 +3608,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
             ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+            if (ggml_tensor * qu = mctx_cur->update_quest_k(ctx0, k_cur, k_idxs, il)) {
+                ggml_build_forward_expand(gf, qu);
+            }
         }
 
         k = mctx_cur->get_k(ctx0, il);
@@ -3540,7 +3620,53 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * use_kq_mask = kq_mask;
+    ggml_tensor * use_kv_rows = kv_rows;
+
+    if (!cparams.training && cparams.flash_attn && kq_b == nullptr && n_tokens == 1 && !hparams.is_swa(il)) {
+        const uint32_t n_active = mctx_cur->get_quest_active_tokens();
+        if (cparams.kv_sparse_threshold > 0 && n_active >= cparams.kv_sparse_threshold) {
+            constexpr int32_t page_size      = llama_kv_cache::QUEST_PAGE_SIZE;
+            constexpr int32_t n_sink_pages   = 4;
+            constexpr int32_t n_recent_pages = 32;
+            const int32_t n_keep_rows        = GGML_PAD((int32_t) std::min<uint32_t>(cparams.kv_sparse_keep, n_active), 256);
+            const int32_t n_active_pages     = (int32_t) ((n_active + page_size - 1) / page_size);
+            const int32_t n_keep_pages       = n_keep_rows / page_size;
+            if (n_active > (uint32_t) n_keep_rows && n_active_pages > n_keep_pages) {
+                if (ggml_tensor * k_minmax = mctx_cur->get_k_minmax(il)) {
+                    const int64_t gqa_ratio = n_head / n_head_kv;
+                    ggml_tensor * q_3d   = ggml_reshape_3d(ctx0, q, n_embd_head_k, gqa_ratio, n_head_kv);
+                    ggml_tensor * q_neg  = ggml_neg(ctx0, ggml_relu(ctx0, ggml_neg(ctx0, q_3d)));
+                    ggml_tensor * q_pos  = ggml_relu(ctx0, q_3d);
+                    ggml_tensor * q_pair = ggml_concat(ctx0, q_neg, q_pos, 2);
+                    ggml_tensor * km_v   = ggml_view_3d(ctx0, k_minmax, n_embd_head_k, n_active_pages, 2 * n_head_kv,
+                                                        k_minmax->nb[1], k_minmax->nb[2], 0);
+                    ggml_tensor * scores_3d = ggml_mul_mat(ctx0, km_v, q_pair);
+                    ggml_tensor * s_min = ggml_view_3d(ctx0, scores_3d, n_active_pages, gqa_ratio, n_head_kv,
+                                                       scores_3d->nb[1], scores_3d->nb[2], 0);
+                    ggml_tensor * s_max = ggml_view_3d(ctx0, scores_3d, n_active_pages, gqa_ratio, n_head_kv,
+                                                       scores_3d->nb[1], scores_3d->nb[2], scores_3d->nb[2] * n_head_kv);
+                    ggml_tensor * per_head = ggml_reshape_2d(ctx0, ggml_add(ctx0, s_min, s_max), n_active_pages, n_head);
+                    ggml_tensor * head_p   = ggml_soft_max(ctx0, ggml_scale(ctx0, per_head, kq_scale));
+                    ggml_tensor * scores   = ggml_reshape_1d(ctx0, ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, head_p))), n_active_pages);
+                    ggml_tensor * top_p  = ggml_top_k(ctx0, scores, std::min(n_active_pages, n_keep_pages));
+                    tidal_kv_rows = ggml_quest_rows(ctx0, top_p, (int32_t) n_active, page_size, n_sink_pages, n_recent_pages, n_keep_rows);
+                    ggml_tensor * neg_i = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, tidal_kv_rows, GGML_TYPE_F32), -1.0f, -0.5f));
+                    tidal_kq_mask = ggml_reshape_2d(ctx0, ggml_cast(ctx0, ggml_scale(ctx0, neg_i, -65504.0f), GGML_TYPE_F16), n_keep_rows, 1);
+                }
+                if (tidal_kv_rows && tidal_kq_mask) {
+                    use_kv_rows = tidal_kv_rows;
+                    use_kq_mask = tidal_kq_mask;
+                    inp->quest_or_duo_built = true;
+                }
+            }
+        }
+        if (cparams.kv_duo_ratio > 0.0f && mctx_cur->get_n_kv() >= 4096) {
+            inp->quest_or_duo_built = true;
+        }
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, use_kq_mask, use_kv_rows, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 

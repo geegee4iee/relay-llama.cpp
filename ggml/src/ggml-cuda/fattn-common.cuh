@@ -40,7 +40,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const uint32_t duo_stream_mask, const int32_t duo_sink_cols, const int32_t duo_recent_col_start);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -203,6 +204,52 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_0(
 
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
         sum += __half2float(K_q2_0[ib].d) * (sumi * Q_ds.x);
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq3(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    static constexpr float centers[8] = {
+        -2.151946f, -1.343909f, -0.756005f, -0.245094f,
+         0.245094f,  0.756005f,  1.343909f,  2.151946f
+    };
+    const block_tq3 * K_tq3 = (const block_tq3 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib  = k_KQ / (QK_TQ3 / int(sizeof(int)));
+        const int iqs = k_KQ % (QK_TQ3 / int(sizeof(int)));
+
+        const float2 d01 = __half22float2(*((const half2 *) &K_tq3[ib].d0));
+        const float d    = (iqs & 8) ? d01.y : d01.x;
+        const uint8_t lo = K_tq3[ib].qs[iqs];
+        const uint8_t hi = (K_tq3[ib].qh[iqs >> 1] >> ((iqs & 1) << 2)) & 0x0Fu;
+
+        const int iter = k_KQ_0 / nthreads;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+        const half2 * q_h2 = (const half2 *) Q_v;
+        const float2 q0 = __half22float2(q_h2[iter * 2 + 0]);
+        const float2 q1 = __half22float2(q_h2[iter * 2 + 1]);
+#else
+        const float2 * q_f2 = (const float2 *) Q_v;
+        const float2 q0 = q_f2[iter * 2 + 0];
+        const float2 q1 = q_f2[iter * 2 + 1];
+#endif
+        const float dot =
+            centers[((lo >> 0) & 3u) | ((hi & 1u) << 2)] * q0.x +
+            centers[((lo >> 2) & 3u) | ((hi & 2u) << 1)] * q0.y +
+            centers[((lo >> 4) & 3u) | ((hi & 4u)     )] * q1.x +
+            centers[((lo >> 6) & 3u) | ((hi & 8u) >> 1)] * q1.y;
+        sum += d * dot;
     }
 
     return sum;
@@ -746,6 +793,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q2_0) {
         return vec_dot_fattn_vec_KQ_q2_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ3) {
+        return vec_dot_fattn_vec_KQ_tq3<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_0) {
         return vec_dot_fattn_vec_KQ_q4_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_1) {
@@ -1384,6 +1433,10 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    const uint32_t duo_stream_mask     = (uint32_t) ggml_get_op_params_i32(KQV, 5);
+    const int32_t  duo_sink_cols       = ggml_get_op_params_i32(KQV, 6);
+    const int32_t  duo_recent_col_start= ggml_get_op_params_i32(KQV, 7);
+
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
@@ -1399,7 +1452,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        duo_stream_mask, duo_sink_cols, duo_recent_col_start
     );
     CUDA_CHECK(cudaGetLastError());
 

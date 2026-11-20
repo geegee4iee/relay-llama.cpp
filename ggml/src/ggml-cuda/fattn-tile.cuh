@@ -812,7 +812,8 @@ static __global__ void flash_attn_tile(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const uint32_t duo_stream_mask, const int32_t duo_sink_cols, const int32_t duo_recent_col_start) {
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
@@ -822,7 +823,7 @@ static __global__ void flash_attn_tile(
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
-    GGML_UNUSED(KV_rows_ptr);
+    GGML_UNUSED_VARS(KV_rows_ptr, duo_stream_mask, duo_sink_cols, duo_recent_col_start);
 
     // Skip unused kernel variants for faster compilation:
 
@@ -1142,7 +1143,8 @@ static __global__ void flash_attn_tile(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        duo_stream_mask, duo_sink_cols, duo_recent_col_start);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

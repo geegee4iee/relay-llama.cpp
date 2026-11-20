@@ -958,6 +958,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_TQ3] = {
+        .type_name                = "tq3",
+        .blck_size                = QK_TQ3,
+        .type_size                = sizeof(block_tq3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq3_ref,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1114,9 +1122,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "SLEEP",
+
+    "QUEST_UPDATE",
+    "QUEST_ROWS",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1229,9 +1240,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "sleep(x)",
+
+    "quest_update(k,idxs)",
+    "quest_rows(top_pages)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5524,6 +5538,68 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_duo(
+        struct ggml_tensor * a,
+        uint32_t             stream_mask,
+        int32_t              sink_cols,
+        int32_t              recent_col_start) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 5, (int32_t) stream_mask);
+    ggml_set_op_params_i32(a, 6, sink_cols);
+    ggml_set_op_params_i32(a, 7, recent_col_start);
+}
+
+struct ggml_tensor * ggml_quest_update(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_minmax,
+        struct ggml_tensor  * k_cur,
+        struct ggml_tensor  * k_idxs,
+        int32_t               page_size) {
+    GGML_ASSERT(page_size > 0);
+    GGML_ASSERT(k_minmax->type == GGML_TYPE_F16);
+    GGML_ASSERT(k_cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_idxs->type == GGML_TYPE_I64 || k_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(k_minmax->ne[0] == k_cur->ne[0]);
+    GGML_ASSERT(k_minmax->ne[2] == 2 * k_cur->ne[1]);
+    GGML_ASSERT(k_cur->ne[2] == k_idxs->ne[0]);
+    GGML_ASSERT(ggml_is_contiguous(k_minmax));
+    GGML_ASSERT(ggml_is_contiguous(k_cur));
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, k_minmax);
+
+    result->op     = GGML_OP_QUEST_UPDATE;
+    result->src[0] = k_cur;
+    result->src[1] = k_idxs;
+    result->src[2] = k_minmax;
+    ggml_set_op_params_i32(result, 0, page_size);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_quest_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_pages,
+        int32_t               n_active_tokens,
+        int32_t               page_size,
+        int32_t               n_sink_pages,
+        int32_t               n_recent_pages,
+        int32_t               n_keep_rows) {
+    GGML_ASSERT(top_pages->type == GGML_TYPE_I32);
+    GGML_ASSERT(page_size > 0 && n_keep_rows > 0 && n_keep_rows % page_size == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_keep_rows);
+
+    result->op     = GGML_OP_QUEST_ROWS;
+    result->src[0] = top_pages;
+    ggml_set_op_params_i32(result, 0, n_active_tokens);
+    ggml_set_op_params_i32(result, 1, page_size);
+    ggml_set_op_params_i32(result, 2, n_sink_pages);
+    ggml_set_op_params_i32(result, 3, n_recent_pages);
+    ggml_set_op_params_i32(result, 4, n_keep_rows);
+
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -7386,7 +7462,8 @@ void ggml_build_backward_expand(
         }
 
         // inplace operations are currently not supported
-        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_VIEW ||
+        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS ||
+            node->op == GGML_OP_QUEST_UPDATE || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
@@ -8053,6 +8130,7 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TQ3:     result = quantize_tq3    (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

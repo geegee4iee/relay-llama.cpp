@@ -59,6 +59,13 @@ struct llama_cparams {
     size_t moe_cache_size;
     float  moe_cache_cpu_share;
     uint32_t n_cpu_kv = 0;
+    float    moe_prob_thresh = 0.0f;
+    uint32_t moe_min_k = 2;
+    enum ggml_type moe_cache_type = GGML_TYPE_COUNT;
+    bool moe_prefetch = false;
+    uint32_t kv_sparse_threshold = 0;
+    uint32_t kv_sparse_keep      = 8192;
+    float    kv_duo_ratio        = 0.0f;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host

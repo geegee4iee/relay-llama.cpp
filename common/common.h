@@ -187,6 +187,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,  // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,    // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_SUFFIX,         // confidence-gated suffix-tree drafting
     COMMON_SPECULATIVE_TYPE_COUNT           // number of types, unknown type
 };
 
@@ -390,6 +391,12 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_speculative_suffix {
+    int32_t n_max     = 16;
+    int32_t min_match = 4;
+    float   min_conf  = 0.65f;
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -405,6 +412,7 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+    common_params_speculative_suffix      suffix;
 
     bool has_dft() const {
         return !draft.mparams.empty();
@@ -619,6 +627,13 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
     uint32_t n_cpu_kv          = 0;    // keep the KV cache of the first N KV layers in CPU memory
+    float    moe_prob_thresh   = 0.0f; // dynamic top-k MoE skipping threshold relative to top-1 weight (0 = disabled)
+    uint32_t moe_min_k         = 2;    // minimum number of experts kept per token when moe_prob_thresh > 0
+    bool     moe_prefetch      = false; // enable cross-layer lookahead async upload for the MoE cache
+    ggml_type moe_cache_type   = GGML_TYPE_COUNT; // mixed-precision VRAM MoE cache quant type (GGML_TYPE_COUNT = native)
+    uint32_t kv_sparse_threshold = 0;   // activate Quest + TidalDecode when n_kv >= threshold (0 = disabled)
+    uint32_t kv_sparse_keep      = 8192;// number of KV tokens kept per decode step under sparse KV attention
+    float    kv_duo_ratio        = 0.0f;// DuoAttention streaming KV head fraction [0.0, 1.0)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

@@ -191,6 +191,15 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+#define QK_TQ3 64
+typedef struct {
+    ggml_half d0;              // 3-bit Gaussian Lloyd-Max scale for elements 0..31
+    ggml_half d1;              // 3-bit Gaussian Lloyd-Max scale for elements 32..63
+    uint8_t   qs[QK_TQ3 / 4];  // low 2 bits per element (4 elements/byte)
+    uint8_t   qh[QK_TQ3 / 8];  // high 1 bit per element (8 elements/byte)
+} block_tq3;
+static_assert(sizeof(block_tq3) == 2 * sizeof(ggml_half) + QK_TQ3 / 4 + QK_TQ3 / 8, "wrong tq3 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

@@ -379,6 +379,13 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.moe_prob_thresh     = params.moe_prob_thresh;
+    cparams.moe_min_k           = params.moe_min_k;
+    cparams.moe_cache_type      = params.moe_cache_type;
+    cparams.moe_prefetch        = params.moe_prefetch;
+    cparams.kv_sparse_threshold = params.kv_sparse_threshold;
+    cparams.kv_sparse_keep      = params.kv_sparse_keep > 0 ? params.kv_sparse_keep : 8192;
+    cparams.kv_duo_ratio        = params.kv_duo_ratio;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -618,7 +625,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share, cparams.moe_prefetch, cparams.moe_cache_type);
         }
 
         sched_reserve();
@@ -2956,6 +2963,13 @@ uint32_t llama_context::graph_max_nodes() const {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
     }
 
+    if (cparams.moe_prob_thresh > 0.0f) {
+        res += 32u * model.hparams.n_layer();
+    }
+    if (cparams.kv_sparse_threshold > 0) {
+        res += 32u * model.hparams.n_layer();
+    }
+
     if (cparams.training) {
         res *= 4;
     }
@@ -4456,6 +4470,12 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.n_cpu_kv                    =*/ 0,
+        /*.moe_prob_thresh             =*/ 0.0f,
+        /*.moe_min_k                   =*/ 2,
+        /*.moe_cache_type              =*/ GGML_TYPE_COUNT,
+        /*.kv_sparse_threshold         =*/ 0,
+        /*.kv_sparse_keep              =*/ 8192,
+        /*.kv_duo_ratio                =*/ 0.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4464,6 +4484,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.moe_prefetch                =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

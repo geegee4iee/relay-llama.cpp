@@ -11,12 +11,14 @@ struct llm_graph_context;
 
 // the experts of a MoE layer, as llm_graph_context::build_moe_ffn passes them to the MoE cache
 struct llama_moe_cache_layer {
-    int32_t       il;
-    ggml_tensor * up_exps;
-    ggml_tensor * gate_exps;
-    ggml_tensor * down_exps;
-    ggml_tensor * gate_up_exps;
-    bool          weight_before_ffn; // the router weights scale the expert input
+    int32_t             il;
+    ggml_tensor *       up_exps;
+    ggml_tensor *       gate_exps;
+    ggml_tensor *       down_exps;
+    ggml_tensor *       gate_up_exps;
+    bool                weight_before_ffn; // the router weights scale the expert input
+    const ggml_tensor * weights = nullptr; // optional pruned router weights [1, n_expert_used, n_tokens]
+    uint32_t            min_k   = 2;       // minimum kept experts per token when weights != nullptr
 };
 
 // the lookup of the selected experts of a layer in the MoE cache, see llama_moe_cache::build_lookup
@@ -36,7 +38,7 @@ class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // cpu_share is the share of the misses computed on the CPU instead of uploaded
-    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share);
+    llama_moe_cache(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share, bool prefetch = false, enum ggml_type cache_type = GGML_TYPE_COUNT);
     ~llama_moe_cache();
 
     // the experts of w in the cache, nullptr if w is not cached

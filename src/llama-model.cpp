@@ -3547,7 +3547,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 "",
                                 false,
-                                cparams.n_cpu_kv);
+                                cparams.n_cpu_kv,
+                                cparams.kv_sparse_threshold);
                     }
                 }
             }

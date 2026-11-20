@@ -466,6 +466,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     const ggml_type type_V = type_V_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V_in;
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q2_0, F16)
+    FATTN_VEC_CASES_ALL_D(TQ3,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q4_1, F16)
     FATTN_VEC_CASES_ALL_D(Q5_0, F16)
@@ -476,6 +477,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
 
     FATTN_VEC_CASES_ALL_D(F16,  Q2_0)
     FATTN_VEC_CASES_ALL_D(Q2_0, Q2_0)
+    FATTN_VEC_CASES_ALL_D(TQ3,  Q2_0)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q2_0)
     FATTN_VEC_CASES_ALL_D(Q4_1, Q2_0)
     FATTN_VEC_CASES_ALL_D(Q5_0, Q2_0)
@@ -486,6 +488,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
 
     FATTN_VEC_CASES_ALL_D(F16,  Q4_0)
     FATTN_VEC_CASES_ALL_D(Q2_0, Q4_0)
+    FATTN_VEC_CASES_ALL_D(TQ3,  Q4_0)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q4_0)
     FATTN_VEC_CASES_ALL_D(Q4_1, Q4_0)
     FATTN_VEC_CASES_ALL_D(Q5_0, Q4_0)
@@ -526,6 +529,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
 
     FATTN_VEC_CASES_ALL_D(F16,  Q8_0)
     FATTN_VEC_CASES_ALL_D(Q2_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D(TQ3,  Q8_0)
     FATTN_VEC_CASES_ALL_D(Q4_0, Q8_0)
     FATTN_VEC_CASES_ALL_D(Q4_1, Q8_0)
     FATTN_VEC_CASES_ALL_D(Q5_0, Q8_0)
@@ -592,6 +596,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -710,15 +715,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
-    // only the MMA kernel reads K/V through kv_rows
+    // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
+    // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && n_kv % FATTN_KQ_STRIDE == 0;
+
     if (kv_rows) {
+        if (can_use_vector_kernel && turing_mma_available(cc) && (Q->ne[1] == 1 || (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] <= 2))) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
             BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
-
-    // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
-    // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {

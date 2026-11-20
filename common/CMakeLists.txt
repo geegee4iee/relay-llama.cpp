@@ -113,6 +113,8 @@ add_library(${TARGET}
     speculative.h
     subproc.cpp
     subproc.h
+    suffix-tree.cpp
+    suffix-tree.h
     trie.cpp
     trie.h
     unicode.cpp

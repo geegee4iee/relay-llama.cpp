@@ -675,6 +675,7 @@ void ggml_compute_forward_add(
             } break;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1132,6 +1133,7 @@ void ggml_compute_forward_add1(
             } break;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1264,6 +1266,7 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -2249,6 +2252,108 @@ void ggml_compute_forward_sleep(const ggml_compute_params * params, ggml_tensor 
     const int64_t t_end = ggml_time_us() + ggml_get_op_params_i32(dst, 0);
 
     while (ggml_time_us() < t_end) {}
+}
+
+void ggml_compute_forward_quest_update(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * k_cur  = dst->src[0];
+    const ggml_tensor * k_idxs = dst->src[1];
+    const int32_t page_size    = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t D         = k_cur->ne[0];
+    const int64_t n_head_kv = k_cur->ne[1];
+    const int64_t n_tokens  = k_cur->ne[2];
+    const int64_t n_pages   = dst->ne[1];
+
+    ggml_fp16_t * minmax_data = (ggml_fp16_t *) dst->data;
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const int64_t row = k_idxs->type == GGML_TYPE_I64
+            ? ((const int64_t *) k_idxs->data)[t]
+            : (int64_t) ((const int32_t *) k_idxs->data)[t];
+        if (row < 0) {
+            continue;
+        }
+        const int64_t p = row / page_size;
+        if (p >= n_pages) {
+            continue;
+        }
+        for (int64_t h = 0; h < n_head_kv; ++h) {
+            const float * kp = (const float *) ((const char *) k_cur->data + h * k_cur->nb[1] + t * k_cur->nb[2]);
+            ggml_fp16_t * pmin = minmax_data + ((h            * n_pages + p) * D);
+            ggml_fp16_t * pmax = minmax_data + (((h + n_head_kv) * n_pages + p) * D);
+            for (int64_t d = 0; d < D; ++d) {
+                const float v    = kp[d];
+                const float vmin = GGML_FP16_TO_FP32(pmin[d]);
+                const float vmax = GGML_FP16_TO_FP32(pmax[d]);
+                if (v < vmin) { pmin[d] = GGML_FP32_TO_FP16(v); }
+                if (v > vmax) { pmax[d] = GGML_FP32_TO_FP16(v); }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_quest_rows(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * top_pages = dst->src[0];
+    const int32_t n_active_tokens = ggml_get_op_params_i32(dst, 0);
+    const int32_t page_size       = ggml_get_op_params_i32(dst, 1);
+    const int32_t n_sink_pages    = ggml_get_op_params_i32(dst, 2);
+    const int32_t n_recent_pages  = ggml_get_op_params_i32(dst, 3);
+    const int32_t n_keep_rows     = ggml_get_op_params_i32(dst, 4);
+
+    const int32_t n_total_pages  = (n_active_tokens + page_size - 1) / page_size;
+    const int32_t n_keep_pages   = n_keep_rows / page_size;
+    const int32_t n_scored_pages = (int32_t) top_pages->ne[0];
+    const int32_t * top_data     = (const int32_t *) top_pages->data;
+    int32_t * out                = (int32_t *) dst->data;
+
+    int32_t out_idx = 0;
+    auto emit_page = [&](int32_t p) {
+        const int32_t base = p * page_size;
+        for (int32_t off = 0; off < page_size && out_idx < n_keep_rows; ++off) {
+            const int32_t r = base + off;
+            out[out_idx++] = (r < n_active_tokens) ? r : -1;
+        }
+    };
+
+    if (n_total_pages <= n_keep_pages) {
+        for (int32_t p = 0; p < n_total_pages; ++p) {
+            emit_page(p);
+        }
+    } else {
+        const int32_t sink_cap     = std::max<int32_t>(1, n_keep_pages / 4);
+        const int32_t sink_end     = std::min<int32_t>(n_sink_pages, std::min<int32_t>(n_total_pages, sink_cap));
+        const int32_t recent_cap   = std::max<int32_t>(1, n_keep_pages / 2);
+        const int32_t recent_count = std::min<int32_t>(n_recent_pages, std::min<int32_t>(n_total_pages - sink_end, recent_cap));
+        const int32_t recent_start = n_total_pages - recent_count;
+        const int32_t mid_need     = std::max<int32_t>(0, n_keep_pages - sink_end - recent_count);
+
+        for (int32_t p = 0; p < sink_end; ++p) {
+            emit_page(p);
+        }
+        int32_t mid_picked = 0;
+        for (int32_t i = 0; i < n_scored_pages && mid_picked < mid_need; ++i) {
+            const int32_t p = top_data[i];
+            if (p >= sink_end && p < recent_start) {
+                emit_page(p);
+                ++mid_picked;
+            }
+        }
+        for (int32_t p = recent_start; p < n_total_pages; ++p) {
+            emit_page(p);
+        }
+    }
+
+    while (out_idx < n_keep_rows) {
+        out[out_idx++] = -1;
+    }
 }
 
 // ggml_compute_tri
@@ -4893,6 +4998,7 @@ void ggml_compute_forward_out_prod(
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -5223,6 +5329,7 @@ void ggml_compute_forward_set(
         case GGML_TYPE_BF16:
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -5449,6 +5556,7 @@ void ggml_compute_forward_get_rows(
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -6132,6 +6240,7 @@ void ggml_compute_forward_clamp(
             } break;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_TQ3:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:

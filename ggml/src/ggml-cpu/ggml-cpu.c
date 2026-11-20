@@ -240,6 +240,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TQ3] = {
+        .from_float               = quantize_row_tq3,
+        .vec_dot                  = ggml_vec_dot_tq3_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -2040,6 +2046,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_sleep(params, tensor);
             } break;
+        case GGML_OP_QUEST_UPDATE:
+            {
+                ggml_compute_forward_quest_update(params, tensor);
+            } break;
+        case GGML_OP_QUEST_ROWS:
+            {
+                ggml_compute_forward_quest_rows(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
@@ -2313,6 +2327,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_LEAKY_RELU:
         case GGML_OP_SLEEP:
+        case GGML_OP_QUEST_UPDATE:
+        case GGML_OP_QUEST_ROWS:
             {
                 n_tasks = 1;
             } break;

@@ -409,6 +409,12 @@ extern "C" {
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
         uint32_t n_cpu_kv;          // number of initial KV cache layers kept on CPU instead of GPU (0 = follow offload_kqv) [EXPERIMENTAL]
+        float    moe_prob_thresh;   // relative router weight threshold vs top-1 expert below which tail experts are skipped (0 = disabled) [EXPERIMENTAL]
+        uint32_t moe_min_k;         // minimum number of experts kept per token when moe_prob_thresh > 0 (default: 2) [EXPERIMENTAL]
+        enum ggml_type moe_cache_type; // mixed-precision VRAM MoE cache quant type (GGML_TYPE_COUNT = native layer type) [EXPERIMENTAL]
+        uint32_t kv_sparse_threshold; // activate Quest + TidalDecode sparse KV attention when n_kv >= threshold (0 = disabled) [EXPERIMENTAL]
+        uint32_t kv_sparse_keep;      // number of KV tokens kept per decode step under sparse KV attention (default: 8192) [EXPERIMENTAL]
+        float    kv_duo_ratio;        // DuoAttention fraction of KV heads treated as streaming sink+recent heads [0.0, 1.0) [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -427,6 +433,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool moe_prefetch; // async lookahead prefetch for the next MoE layer into the VRAM expert cache [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

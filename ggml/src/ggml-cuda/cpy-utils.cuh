@@ -189,6 +189,63 @@ static __device__ void quantize_f32_q2_0_block(const float * __restrict__ x, blo
     }
 }
 
+static __device__ __forceinline__ uint8_t tq3_quant_sym3_dev(float z) {
+    if (z < 0.0f) {
+        if (z < -1.049957f) return (z < -1.747928f) ? 0 : 1;
+        return (z < -0.500550f) ? 2 : 3;
+    } else {
+        if (z < 1.049957f) return (z < 0.500550f) ? 4 : 5;
+        return (z < 1.747928f) ? 6 : 7;
+    }
+}
+
+static __device__ void quantize_f32_tq3_block(const float * __restrict__ x, block_tq3 * __restrict__ y) {
+    static constexpr float centers[8] = {
+        -2.151946f, -1.343909f, -0.756005f, -0.245094f,
+         0.245094f,  0.756005f,  1.343909f,  2.151946f
+    };
+
+    float scales[2] = { 0.0f, 0.0f };
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const float * xh = x + h * 32;
+        float sum2 = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            sum2 += xh[j] * xh[j];
+        }
+        const float sigma = sqrtf(sum2 * (1.0f / 32.0f));
+        float sum_xc = 0.0f;
+        float sum_cc = 0.0f;
+        const float inv_sigma = sigma > 0.0f ? (1.0f / sigma) : 0.0f;
+        for (int b = 0; b < 4; ++b) {
+            uint8_t packed_qs0 = 0;
+            uint8_t packed_qs1 = 0;
+            uint8_t packed_qh  = 0;
+            for (int k = 0; k < 8; ++k) {
+                const int j = b * 8 + k;
+                const uint8_t c = sigma > 0.0f ? tq3_quant_sym3_dev(xh[j] * inv_sigma) : 0;
+                const float cv = centers[c];
+                sum_xc += xh[j] * cv;
+                sum_cc += cv * cv;
+                if (k < 4) {
+                    packed_qs0 |= uint8_t((c & 3u) << (k * 2));
+                } else {
+                    packed_qs1 |= uint8_t((c & 3u) << ((k - 4) * 2));
+                }
+                if (c & 4u) {
+                    packed_qh |= uint8_t(1u << k);
+                }
+            }
+            y->qs[h * 8 + b * 2 + 0] = packed_qs0;
+            y->qs[h * 8 + b * 2 + 1] = packed_qs1;
+            y->qh[h * 4 + b]         = packed_qh;
+        }
+        scales[h] = (sigma > 0.0f && sum_cc > 0.0f && sum_xc > 0.0f) ? (sum_xc / sum_cc) : sigma;
+    }
+    y->d0 = scales[0];
+    y->d1 = scales[1];
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
@@ -245,6 +302,10 @@ static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_q2_0(const char * cxi, char * cdsti) {
     quantize_f32_q2_0_block((const float *)cxi, (block_q2_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_tq3(const char * cxi, char * cdsti) {
+    quantize_f32_tq3_block((const float *)cxi, (block_tq3 *)cdsti);
 }
 
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {

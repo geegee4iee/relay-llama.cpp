@@ -1779,6 +1779,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.n_cpu_kv            = params.n_cpu_kv;
+    cparams.moe_prob_thresh     = params.moe_prob_thresh;
+    cparams.moe_min_k           = params.moe_min_k;
+    cparams.moe_prefetch        = params.moe_prefetch;
+    cparams.moe_cache_type      = params.moe_cache_type;
+    cparams.kv_sparse_threshold = params.kv_sparse_threshold;
+    cparams.kv_sparse_keep      = params.kv_sparse_keep;
+    cparams.kv_duo_ratio        = params.kv_duo_ratio;
 
     return cparams;
 }

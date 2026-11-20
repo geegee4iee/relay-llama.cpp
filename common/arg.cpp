@@ -288,6 +288,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q4_1,
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_TQ3,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
 };
@@ -2781,6 +2782,83 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
+        {"--moe-prob-thresh"}, "F",
+        string_format("dynamic top-k MoE skipping threshold relative to top-1 expert weight (0 = disabled, e.g. 0.25, default: %.2f)", (double) params.moe_prob_thresh),
+        [](common_params & params, const std::string & value) {
+            const float thresh = std::stof(value);
+            if (thresh < 0.0f || thresh >= 1.0f) {
+                throw std::invalid_argument("invalid value: expected 0 <= thresh < 1");
+            }
+            params.moe_prob_thresh = thresh;
+        }
+    ).set_env("LLAMA_ARG_MOE_PROB_THRESH"));
+    add_opt(common_arg(
+        {"--moe-min-k"}, "N",
+        string_format("minimum active experts kept per token when --moe-prob-thresh > 0 (default: %u)", params.moe_min_k),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_min_k = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_MIN_K"));
+    add_opt(common_arg(
+        {"--moe-prefetch"},
+        "enable cross-layer lookahead async PCIe upload for the VRAM MoE expert cache",
+        [](common_params & params) {
+            params.moe_prefetch = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
+        {"--moe-cache-type"}, "TYPE",
+        "mixed-precision VRAM MoE cache quant type for non-critical layers (native, q2_k, q3_k, q4_0, q4_k, iq2_s, iq3_xxs, iq3_s, iq4_nl, iq4_xs; default: native)",
+        [](common_params & params, const std::string & value) {
+            if (value == "native" || value == "none") {
+                params.moe_cache_type = GGML_TYPE_COUNT;
+                return;
+            }
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                const auto gt = (ggml_type) t;
+                if (ggml_is_quantized(gt) && ggml_type_name(gt) != nullptr && value == ggml_type_name(gt)) {
+                    params.moe_cache_type = gt;
+                    return;
+                }
+            }
+            throw std::invalid_argument("Unsupported --moe-cache-type: " + value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_TYPE"));
+    add_opt(common_arg(
+        {"--kv-sparse-threshold"}, "N",
+        "activate Quest + TidalDecode sparse KV decode when active KV length >= N (0 = disabled, recommended: 32768)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.kv_sparse_threshold = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KV_SPARSE_THRESHOLD"));
+    add_opt(common_arg(
+        {"--kv-sparse-keep"}, "N",
+        "KV token budget kept per decode step when sparse KV attention is active (default: 8192)",
+        [](common_params & params, int value) {
+            if (value < 256) {
+                throw std::invalid_argument("kv-sparse-keep must be >= 256");
+            }
+            params.kv_sparse_keep = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KV_SPARSE_KEEP"));
+    add_opt(common_arg(
+        {"--kv-duo-ratio"}, "F",
+        "DuoAttention fraction of KV heads (tail heads) kept as sink+recent streaming heads in decode [0.0, 1.0) (default: 0.0)",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v >= 1.0f) {
+                throw std::invalid_argument("kv-duo-ratio must be in [0.0, 1.0)");
+            }
+            params.kv_duo_ratio = v;
+        }
+    ).set_env("LLAMA_ARG_KV_DUO_RATIO"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
@@ -4374,6 +4452,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
             }
             params.speculative.ngram_mod.n_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-suffix-min-match"}, "N",
+        string_format("minimum exact suffix token length for suffix decoding (default: %d)", params.speculative.suffix.min_match),
+        [](common_params & params, int value) {
+            if (value < 3 || value > 32) {
+                throw std::invalid_argument("suffix min-match must be between 3 and 32 inclusive");
+            }
+            params.speculative.suffix.min_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-suffix-min-conf"}, "F",
+        string_format("minimum continuation vote confidence [0..1] for suffix decoding (default: %.2f)", params.speculative.suffix.min_conf),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("suffix min-conf must be between 0.0 and 1.0");
+            }
+            params.speculative.suffix.min_conf = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-suffix-max-len"}, "N",
+        string_format("maximum drafted tokens per step for suffix decoding (default: %d)", params.speculative.suffix.n_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {
+                throw std::invalid_argument("suffix max-len must be between 1 and 64 inclusive");
+            }
+            params.speculative.suffix.n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

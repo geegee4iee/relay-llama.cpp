@@ -68,6 +68,64 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
     }
 }
 
+static inline uint8_t tq3_quant_sym3(float z) {
+    if (z < 0.0f) {
+        if (z < -1.049957f) return (z < -1.747928f) ? 0 : 1;
+        return (z < -0.500550f) ? 2 : 3;
+    } else {
+        if (z < 1.049957f) return (z < 0.500550f) ? 4 : 5;
+        return (z < 1.747928f) ? 6 : 7;
+    }
+}
+
+void quantize_row_tq3_ref(const float * GGML_RESTRICT x, block_tq3 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ3;
+    static const float centers[8] = {
+        -2.151946f, -1.343909f, -0.756005f, -0.245094f,
+         0.245094f,  0.756005f,  1.343909f,  2.151946f
+    };
+
+    assert(k % qk == 0);
+    const int64_t nb = k / qk;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float * xb = x + i * qk;
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        memset(y[i].qh, 0, sizeof(y[i].qh));
+
+        float scales[2] = { 0.0f, 0.0f };
+        for (int h = 0; h < 2; ++h) {
+            const float * xh = xb + h * 32;
+            float sum2 = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                sum2 += xh[j] * xh[j];
+            }
+            const float sigma = sqrtf(sum2 * (1.0f / 32.0f));
+            if (sigma <= 0.0f) {
+                // default code 3/4 near 0 with scale 0 dequantizes to 0
+                continue;
+            }
+            const float inv_sigma = 1.0f / sigma;
+            float sum_xc = 0.0f;
+            float sum_cc = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                const uint8_t c = tq3_quant_sym3(xh[j] * inv_sigma);
+                const float cv = centers[c];
+                sum_xc += xh[j] * cv;
+                sum_cc += cv * cv;
+                const int idx = h * 32 + j;
+                y[i].qs[idx / 4] |= (uint8_t)((c & 3u) << ((idx % 4) * 2));
+                if (c & 4u) {
+                    y[i].qh[idx / 8] |= (uint8_t)(1u << (idx % 8));
+                }
+            }
+            scales[h] = (sum_cc > 0.0f && sum_xc > 0.0f) ? (sum_xc / sum_cc) : sigma;
+        }
+        y[i].d0 = GGML_FP32_TO_FP16(scales[0]);
+        y[i].d1 = GGML_FP32_TO_FP16(scales[1]);
+    }
+}
+
 void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK2_0;
 
@@ -435,6 +493,28 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
             const int bit_offset = j % 8;
             const uint8_t bit = (x[i].qs[byte_index] >> bit_offset) & 1;
             y[i*qk + j] = bit ? d : neg_d;
+        }
+    }
+}
+
+void dequantize_row_tq3(const block_tq3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ3;
+    static const float centers[8] = {
+        -2.151946f, -1.343909f, -0.756005f, -0.245094f,
+         0.245094f,  0.756005f,  1.343909f,  2.151946f
+    };
+
+    assert(k % qk == 0);
+    const int64_t nb = k / qk;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d0 = GGML_FP16_TO_FP32(x[i].d0);
+        const float d1 = GGML_FP16_TO_FP32(x[i].d1);
+        for (int j = 0; j < qk; ++j) {
+            const uint8_t lo = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            const uint8_t hi = (x[i].qh[j / 8] >> (j % 8)) & 0x01;
+            const float d = j < 32 ? d0 : d1;
+            y[i * qk + j] = d * centers[lo | (hi << 2)];
         }
     }
 }
@@ -2118,6 +2198,12 @@ size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+size_t quantize_tq3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    UNUSED(quant_weights);
+    quantize_row_tq3_ref(src, (block_tq3 *)dst, (int64_t)nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_TQ3, n_per_row);
 }
 
 size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {

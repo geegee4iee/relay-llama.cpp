@@ -397,6 +397,8 @@ public:
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
+    bool quest_or_duo_built = false;
+
     llm_attn_mask self_attn_mask;
 
     // note: assumes v_rot^2 == I
@@ -1141,6 +1143,9 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
+
+    mutable ggml_tensor * tidal_kv_rows = nullptr;
+    mutable ggml_tensor * tidal_kq_mask = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
