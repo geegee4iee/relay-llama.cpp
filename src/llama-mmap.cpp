@@ -307,19 +307,21 @@ struct llama_file::impl {
         const size_t bytes_to_read = (offset_from_alignment + len + alignment - 1) & ~(alignment - 1);
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
 
-        struct aligned_buffer_deleter {
-            void operator()(void * p) const { _aligned_free(p); }
-        };
-        std::unique_ptr<void, aligned_buffer_deleter> buffer(_aligned_malloc(buffer_size, alignment));
-        if (!buffer) {
-            LLAMA_LOG_WARN("%s: Falling back to buffered I/O due to %s\n",
-                           __func__, GetErrorMessageWin32(ERROR_NOT_ENOUGH_MEMORY).c_str());
-            CloseHandle(fp_win32_direct);
-            fp_win32_direct = INVALID_HANDLE_VALUE;
-            alignment = 1;
-            seek(offset, SEEK_SET);
-            read_raw_unsafe(dest, len);
-            return;
+        if (aligned_buf_size < buffer_size) {
+            void * next = _aligned_malloc(buffer_size, alignment);
+            if (!next) {
+                LLAMA_LOG_WARN("%s: Falling back to buffered I/O due to %s\n",
+                               __func__, GetErrorMessageWin32(ERROR_NOT_ENOUGH_MEMORY).c_str());
+                CloseHandle(fp_win32_direct);
+                fp_win32_direct = INVALID_HANDLE_VALUE;
+                alignment = 1;
+                seek(offset, SEEK_SET);
+                read_raw_unsafe(dest, len);
+                return;
+            }
+            _aligned_free(aligned_buf);
+            aligned_buf = next;
+            aligned_buf_size = buffer_size;
         }
 
         seek(aligned_offset, SEEK_SET);
@@ -328,11 +330,11 @@ struct llama_file::impl {
         size_t copied = 0;
         for (size_t done = 0; done < bytes_to_read; ) {
             const size_t n = std::min(buffer_size, bytes_to_read - done);
-            read_raw_unsafe(buffer.get(), n);
+            read_raw_unsafe(aligned_buf, n);
 
             const size_t chunk_skip = std::min(skip, n);
             const size_t count = std::min(n - chunk_skip, len - copied);
-            memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + chunk_skip, count);
+            memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(aligned_buf) + chunk_skip, count);
 
             copied += count;
             skip   -= chunk_skip;
@@ -391,6 +393,7 @@ struct llama_file::impl {
     }
 
     ~impl() {
+        _aligned_free(aligned_buf);
         if (fp_win32_direct != INVALID_HANDLE_VALUE) {
             CloseHandle(fp_win32_direct);
         }
@@ -398,6 +401,8 @@ struct llama_file::impl {
             std::fclose(fp);
         }
     }
+    void * aligned_buf = nullptr;
+    size_t aligned_buf_size = 0;
     std::string fname;
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
@@ -646,6 +651,7 @@ llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
 llama_file::~llama_file() = default;
 
+const char * llama_file::filename() const { return pimpl->fname.c_str(); }
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 

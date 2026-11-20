@@ -6,8 +6,8 @@
 #include <vector>
 #include <cstdio>
 
-// staging buffer size for direct I/O reads, 64MB works well for NVMe drives
-#define LLAMA_DIRECT_IO_BUFFER_SIZE (64 * 1024 * 1024)
+// staging buffer size for direct I/O reads, 16MB saturates NVMe queues while bounding multi-worker memory
+#define LLAMA_DIRECT_IO_BUFFER_SIZE (16 * 1024 * 1024)
 
 struct llama_file;
 struct llama_mmap;
@@ -22,6 +22,7 @@ struct llama_file {
     llama_file(FILE * file);
     ~llama_file();
 
+    const char * filename() const;
     size_t tell() const;
     size_t size() const;
 

@@ -8,11 +8,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
 #include <unordered_set>
 
 static const size_t kiB = 1024;
@@ -1778,6 +1782,15 @@ bool llama_model_loader::load_all_data(
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     // allocated from the CPU buffer type, which uses vm_allocate on Apple platforms, so freeing it returns its pages to the OS right away
     ggml_backend_buffer_ptr read_buf;
+
+    struct host_read_job {
+        ggml_tensor * cur;
+        const llama_tensor_weight * weight;
+        size_t n_size;
+    };
+    std::vector<host_read_job> host_jobs;
+    size_t host_bytes_total = 0;
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1835,6 +1848,11 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                if (!check_tensors && std::strcmp(file->filename(), "(file*)") != 0) {
+                    host_jobs.push_back({ cur, weight, n_size });
+                    host_bytes_total += n_size;
+                    continue;
+                }
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {
@@ -1928,6 +1946,97 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+    if (!host_jobs.empty()) {
+        std::sort(host_jobs.begin(), host_jobs.end(), [](const host_read_job & a, const host_read_job & b) {
+            if (a.weight->idx != b.weight->idx) {
+                return a.weight->idx < b.weight->idx;
+            }
+            return a.weight->offs < b.weight->offs;
+        });
+
+        // Consumer NVMe direct I/O prefers 1 strictly sequential stream over 4 distant LBA seeks; buffered I/O scales across 4 threads.
+        const size_t n_workers = (!use_direct_io && host_bytes_total >= 64 * MiB && host_jobs.size() >= 8)
+            ? std::min<size_t>({ 4, std::max<size_t>(1, std::thread::hardware_concurrency()), host_jobs.size() })
+            : 1;
+
+        if (n_workers == 1) {
+            for (const auto & job : host_jobs) {
+                if (progress_callback && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                    for (auto * event : events) {
+                        ggml_backend_event_synchronize(event);
+                        ggml_backend_event_free(event);
+                    }
+                    for (auto * buf : host_buffers) {
+                        ggml_backend_buffer_free(buf);
+                    }
+                    ggml_backend_free(upload_backend);
+                    return false;
+                }
+                const auto & file = files.at(job.weight->idx);
+                file->seek(job.weight->offs, SEEK_SET);
+                file->read_raw(job.cur->data, job.n_size);
+                size_done += job.n_size;
+            }
+        } else {
+            // Partition byte-balanced contiguous slices across parallel workers to push NVMe queue depth sequentially.
+            std::atomic<bool> failed{false};
+            std::mutex err_mu;
+            std::exception_ptr err_ptr;
+            std::vector<std::thread> workers;
+            workers.reserve(n_workers);
+
+            std::vector<size_t> cuts(n_workers + 1, host_jobs.size());
+            cuts[0] = 0;
+            size_t cum_bytes = 0;
+            size_t next_w = 1;
+            for (size_t i = 0; i < host_jobs.size() && next_w < n_workers; ++i) {
+                cum_bytes += host_jobs[i].n_size;
+                while (next_w < n_workers && cum_bytes * n_workers >= host_bytes_total * next_w) {
+                    cuts[next_w++] = i + 1;
+                }
+            }
+            for (size_t w = 0; w < n_workers; ++w) {
+                const size_t begin = cuts[w];
+                const size_t end   = cuts[w + 1];
+                workers.emplace_back([&, begin, end]() {
+                    try {
+                        std::vector<std::unique_ptr<llama_file>> wfiles(files.size());
+                        for (size_t idx = begin; idx < end && !failed.load(std::memory_order_relaxed); ++idx) {
+                            const auto & job = host_jobs[idx];
+                            auto & wf = wfiles[job.weight->idx];
+                            if (!wf) {
+                                wf = std::make_unique<llama_file>(files.at(job.weight->idx)->filename(), "rb", use_direct_io);
+                            }
+                            wf->seek(job.weight->offs, SEEK_SET);
+                            wf->read_raw(job.cur->data, job.n_size);
+                        }
+                    } catch (...) {
+                        std::lock_guard<std::mutex> lk(err_mu);
+                        if (!err_ptr) {
+                            err_ptr = std::current_exception();
+                        }
+                        failed.store(true, std::memory_order_relaxed);
+                    }
+                });
+            }
+            for (auto & th : workers) {
+                th.join();
+            }
+            if (err_ptr) {
+                for (auto * event : events) {
+                    ggml_backend_event_synchronize(event);
+                    ggml_backend_event_free(event);
+                }
+                for (auto * buf : host_buffers) {
+                    ggml_backend_buffer_free(buf);
+                }
+                ggml_backend_free(upload_backend);
+                std::rethrow_exception(err_ptr);
+            }
+            size_done += host_bytes_total;
+        }
     }
 
     // free temporary resources used for async uploads

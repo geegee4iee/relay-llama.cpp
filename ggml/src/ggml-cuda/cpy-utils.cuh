@@ -153,6 +153,42 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     }
 }
 
+static __device__ void quantize_f32_q2_0_block(const float * __restrict__ x, block_q2_0 * __restrict__ y) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK2_0; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    // Q2_0 stores c in {0..3} mapped to (c - 1) in {-1, 0, +1, +2}; optimize scale in 1 LS pass.
+    float d  = amax * 0.6f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    float sumqx = 0.0f;
+    float sumq2 = 0.0f;
+    for (int j = 0; j < QK2_0; ++j) {
+        const float w = x[j];
+        int c = int(roundf(w * id)) + 1;
+        c = c < 0 ? 0 : (c > 3 ? 3 : c);
+        const float s = float(c - 1);
+        sumqx += w * s;
+        sumq2 += s * s;
+    }
+    if (sumq2 > 0.0f && sumqx > 0.0f) {
+        d  = sumqx / sumq2;
+        id = 1.0f / d;
+    }
+
+    y->d = d;
+    for (int b = 0; b < QK2_0 / 4; ++b) {
+        uint8_t packed = 0;
+        for (int k = 0; k < 4; ++k) {
+            int c = int(roundf(x[b * 4 + k] * id)) + 1;
+            c = c < 0 ? 0 : (c > 3 ? 3 : c);
+            packed |= uint8_t(c) << (k * 2);
+        }
+        y->qs[b] = packed;
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
@@ -205,6 +241,10 @@ static __device__ void cpy_blck_f32_q5_1(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
     quantize_f32_q8_0_block((const float *)cxi, (block_q8_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_q2_0(const char * cxi, char * cdsti) {
+    quantize_f32_q2_0_block((const float *)cxi, (block_q2_0 *)cdsti);
 }
 
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
