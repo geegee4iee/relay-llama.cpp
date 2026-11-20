@@ -206,6 +206,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.n_cpu_kv                = params.n_cpu_kv;
     cparams.no_perf                 = params.no_perf;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -586,6 +587,7 @@ llama_context::llama_context(
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
+            cparams.n_cpu_kv == 0 &&
             !model.has_tensor_overrides() &&
             cparams.moe_cache_size == 0; // not supported by the MoE cache
 
@@ -4453,6 +4455,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.n_cpu_kv                    =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

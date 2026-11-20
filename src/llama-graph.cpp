@@ -3197,6 +3197,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
     ggml_tensor * cur;
+    ggml_tensor * attn_op = nullptr;
+    const bool cpu_kv = !cparams.offload_kqv || (k->buffer != nullptr && ggml_backend_buffer_is_host(k->buffer));
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
@@ -3229,6 +3231,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
+        attn_op = cur;
 
         if (v_mla) {
 #if 0
@@ -3304,11 +3307,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        attn_op = cur;
+    }
 
-        if (!cparams.offload_kqv) {
-            // all nodes between the KV store and the attention output are run on the CPU
-            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+    if (cpu_kv) {
+        // all nodes between the KV store and the attention output are run on the CPU
+        if (attn_op != nullptr && attn_op != cur) {
+            ggml_backend_sched_set_tensor_backend(sched, attn_op, backend_cpu);
         }
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
     }
 
     ggml_build_forward_expand(gf, cur);

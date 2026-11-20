@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
                const char * name_tag,
-                     bool   is_indexer) :
+                     bool   is_indexer,
+                 uint32_t   n_cpu_kv) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
@@ -213,7 +214,7 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        if (offload && (uint32_t) layers.size() >= n_cpu_kv) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 

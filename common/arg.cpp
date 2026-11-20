@@ -2739,6 +2739,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
+        {"-nckv", "--n-cpu-kv"}, "N",
+        "keep the KV cache of the first N KV layers in CPU memory",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_cpu_kv = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_N_CPU_KV"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {
